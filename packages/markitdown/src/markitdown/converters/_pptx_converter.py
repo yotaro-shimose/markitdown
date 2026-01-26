@@ -160,7 +160,7 @@ class PptxConverter(DocumentConverter):
                             counter = 1
                             while f"{base_filename}_{counter}.jpg" in self._filename_pool:
                                 counter += 1
-                            filename = f"{base_filename}_uv{counter}.jpg"
+                            filename = f"{base_filename}_{counter}.jpg"
                         
                         self._filename_pool.add(filename)
                         
