@@ -38,6 +38,7 @@ class PptxConverter(DocumentConverter):
     def __init__(self):
         super().__init__()
         self._html_converter = HtmlConverter()
+        self._filename_pool = set()  # Track used filenames to avoid duplicates
 
     def accepts(
         self,
@@ -76,6 +77,7 @@ class PptxConverter(DocumentConverter):
             )
 
         # Perform the conversion
+        self._filename_pool = set()  # Reset pool for each conversion
         presentation = pptx.Presentation(file_stream)
         md_content = ""
         slide_num = 0
@@ -150,7 +152,18 @@ class PptxConverter(DocumentConverter):
                         md_content += f"\n![{alt_text}](data:{content_type};base64,{b64_string})\n"
                     else:
                         # A placeholder name
-                        filename = re.sub(r"\W", "", shape.name) + ".jpg"
+                        base_filename = re.sub(r"\W", "", shape.name)
+                        filename = base_filename + ".jpg"
+                        
+                        # Handle duplicate filenames
+                        if filename in self._filename_pool:
+                            counter = 1
+                            while f"{base_filename}_{counter}.jpg" in self._filename_pool:
+                                counter += 1
+                            filename = f"{base_filename}_{counter}.jpg"
+                        
+                        self._filename_pool.add(filename)
+                        
                         if image_dir is not None:
                             image_dir = Path(image_dir)
                             image_dir.mkdir(exist_ok=True, parents=True)
