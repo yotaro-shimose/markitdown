@@ -4,9 +4,11 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 import numpy as np
+import numpy.typing as npt
 
 # == Add by Masahiro (2026/01/28) ==
 from openpyxl import load_workbook
+from openpyxl.workbook.workbook import Workbook as OpenpyxlWorkbook
 from scipy.ndimage import label
 from spire.xls import Workbook, XlsShape
 
@@ -14,6 +16,8 @@ from .._base_converter import DocumentConverter, DocumentConverterResult
 from .._exceptions import MISSING_DEPENDENCY_MESSAGE, MissingDependencyException
 from .._stream_info import StreamInfo
 from ._html_converter import HtmlConverter
+
+Mask2D = npt.NDArray[np.bool_]
 
 
 def safe_name(name: str) -> str:
@@ -178,27 +182,15 @@ class XlsxConverter(DocumentConverter):
         return False
 
     # == Add by Masahiro (2026/02/09) ==
-    def find_true_segments(self, arr):
-        """
-        1次元 boolean array から
-        (start, end) の連続 True 区間を返す
-        """
-        segments = []
-        start = None
-
-        for i, v in enumerate(arr):
-            if v and start is None:
-                start = i
-            elif not v and start is not None:
-                segments.append((start, i - 1))
-                start = None
-
-        if start is not None:
-            segments.append((start, len(arr) - 1))
-
-        return segments
-
-    def count_nan_or_edge(self, mask, start_r, start_c, dr, dc):
+    # def count_nan_or_edge(self, mask, start_r, start_c, dr, dc):
+    def count_nan_or_edge(
+        self,
+        mask: Mask2D,
+        start_r: int,
+        start_c: int,
+        dr: int,
+        dc: int,
+    ) -> int:
         """
         mask から (start_r, start_c) の外側に向かって
         dr, dc 方向に何マス連続で
@@ -222,24 +214,24 @@ class XlsxConverter(DocumentConverter):
         return count
 
     # 周囲が NaN（または端）かチェック
-    def is_nan_or_edge(self, mask, r, c):
+    # def is_nan_or_edge(self, mask, r, c):
+    def is_nan_or_edge(self, mask: Mask2D, r: int, c: int) -> bool:
         if r < 0 or r >= mask.shape[0]:
             return True
         if c < 0 or c >= mask.shape[1]:
             return True
-        return not mask[r, c]
+        return not bool(mask[r, c])
 
     def proc_md_content(
         self,
-        md_content,
-        s,
-        sheets,
-        wb_img,
-        xlsx_path,
-        media_dir,
-        md_dir,
+        s: str,
+        sheets: dict[str, pd.DataFrame],
+        wb_img: OpenpyxlWorkbook,
+        xlsx_path: Path,
+        media_dir: Path,
+        md_dir: Path,
         **kwargs: Any,
-    ):
+    ) -> str:
 
         # html_content = sheets[s].to_html(index=False)
         df = sheets[s].replace(
@@ -431,6 +423,10 @@ class XlsxConverter(DocumentConverter):
         # == Add by Masahiro (2026/01/28) ==
 
         # print('stream_info.local_path:', stream_info.local_path)
+
+        if stream_info.local_path is None:
+            raise ValueError("stream_info.local_path is None")
+
         xlsx_path = Path(stream_info.local_path).resolve()
         media_dir = xlsx_path.parent / "media"
         media_dir.mkdir(exist_ok=True)
@@ -443,11 +439,11 @@ class XlsxConverter(DocumentConverter):
 
         # all_md_content = ""
 
+        md_content = ""
         for sheet_idx, s in enumerate(sheets, start=1):
             print(s)
-            md_content = ""
             md_content = self.proc_md_content(
-                md_content, s, sheets, wb_img, xlsx_path, media_dir, md_dir, **kwargs
+                s, sheets, wb_img, xlsx_path, media_dir, md_dir, **kwargs
             )
             # all_md_content = proc_md_content(all_md_content)
 
@@ -576,27 +572,14 @@ class XlsConverter(DocumentConverter):
 
     #     return DocumentConverterResult(markdown=md_content.strip())
 
-    def find_true_segments(self, arr):
-        """
-        1次元 boolean array から
-        (start, end) の連続 True 区間を返す
-        """
-        segments = []
-        start = None
-
-        for i, v in enumerate(arr):
-            if v and start is None:
-                start = i
-            elif not v and start is not None:
-                segments.append((start, i - 1))
-                start = None
-
-        if start is not None:
-            segments.append((start, len(arr) - 1))
-
-        return segments
-
-    def count_nan_or_edge(self, mask, start_r, start_c, dr, dc):
+    def count_nan_or_edge(
+        self,
+        mask: Mask2D,
+        start_r: int,
+        start_c: int,
+        dr: int,
+        dc: int,
+    ) -> int:
         """
         mask から (start_r, start_c) の外側に向かって
         dr, dc 方向に何マス連続で
@@ -620,24 +603,24 @@ class XlsConverter(DocumentConverter):
         return count
 
     # 周囲が NaN（または端）かチェック
-    def is_nan_or_edge(self, mask, r, c):
+    # def is_nan_or_edge(self, mask, r, c):
+    def is_nan_or_edge(self, mask: Mask2D, r: int, c: int) -> bool:
         if r < 0 or r >= mask.shape[0]:
             return True
         if c < 0 or c >= mask.shape[1]:
             return True
-        return not mask[r, c]
+        return not bool(mask[r, c])
 
     def proc_md_content(
         self,
-        md_content,
-        s,
-        sheets,
-        wb_img,
-        xlsx_path,
-        media_dir,
-        md_dir,
+        s: str,
+        sheets: dict[str, pd.DataFrame],
+        wb_img: OpenpyxlWorkbook,
+        xlsx_path: Path,
+        media_dir: Path,
+        md_dir: Path,
         **kwargs: Any,
-    ):
+    ) -> str:
 
         # html_content = sheets[s].to_html(index=False)
         df = sheets[s].replace(
@@ -784,11 +767,11 @@ class XlsConverter(DocumentConverter):
                 md_path = xlsx_path.with_name(f"{xlsx_path.stem}__{s}__img{i}.md")
                 md_path.write_text(md_content, encoding="utf-8")
 
-        _ = _export_charts_via_excel_com(xlsx_path, s, media_dir)
+        _ = _export_charts_via_excel_com(xlsx_path, s, media_dir, md_dir)
         # if chart_md:
         #     md_content += "### Charts\n" + "\n\n".join(chart_md) + "\n\n"
 
-        # _ = _export_chart_sheets_via_excel_com(xlsx_path, s, media_dir)
+        # _ = _export_chart_sheets_via_excel_com(xlsx_path, s, media_dir, md_dir)
         # if chart_sheet_md:
         #     md_content += "## Chart Sheets\n\n" + "\n".join(chart_sheet_md) + "\n"
 
@@ -829,6 +812,10 @@ class XlsConverter(DocumentConverter):
         # == Add by Masahiro (2026/01/28) ==
 
         # print('stream_info.local_path:', stream_info.local_path)
+
+        if stream_info.local_path is None:
+            raise ValueError("stream_info.local_path is None")
+
         xlsx_path = Path(stream_info.local_path).resolve()
         media_dir = xlsx_path.parent / "media"
         media_dir.mkdir(exist_ok=True)
@@ -841,11 +828,11 @@ class XlsConverter(DocumentConverter):
 
         # all_md_content = ""
 
+        md_content = ""
         for sheet_idx, s in enumerate(sheets, start=1):
             print(s)
-            md_content = ""
             md_content = self.proc_md_content(
-                md_content, s, sheets, wb_img, xlsx_path, media_dir, md_dir, **kwargs
+                s, sheets, wb_img, xlsx_path, media_dir, md_dir, **kwargs
             )
             # all_md_content = proc_md_content(all_md_content)
 
