@@ -1,22 +1,29 @@
+import re
 import sys
-from typing import BinaryIO, Any
-from ._html_converter import HtmlConverter
-from .._base_converter import DocumentConverter, DocumentConverterResult
-from .._exceptions import MissingDependencyException, MISSING_DEPENDENCY_MESSAGE
-from .._stream_info import StreamInfo
+from pathlib import Path
+from typing import Any, BinaryIO
+
+import numpy as np
 
 # == Add by Masahiro (2026/01/28) ==
 from openpyxl import load_workbook
-from pathlib import Path
-import os
+from scipy.ndimage import label
 from spire.xls import Workbook, XlsShape
-import re
+
+from .._base_converter import DocumentConverter, DocumentConverterResult
+from .._exceptions import MISSING_DEPENDENCY_MESSAGE, MissingDependencyException
+from .._stream_info import StreamInfo
+from ._html_converter import HtmlConverter
+
 
 def safe_name(name: str) -> str:
     # Windowsで使えない文字を置換
     return re.sub(r'[\\/:*?"<>|]', "_", name)
 
-def _export_charts_via_excel_com(xlsx_path: Path, sheet_name: str, media_dir: Path) -> list[str]:
+
+def _export_charts_via_excel_com(
+    xlsx_path: Path, sheet_name: str, media_dir: Path, md_dir: Path
+) -> list[str]:
 
     xlsx_path = Path(xlsx_path).resolve()
     # print('xlsx_path:', xlsx_path)
@@ -36,7 +43,7 @@ def _export_charts_via_excel_com(xlsx_path: Path, sheet_name: str, media_dir: Pa
                 continue
 
             for j in range(worksheet.Charts.Count):
-                print('チャート保存中')
+                print("チャート保存中")
                 fname = f"{xlsx_path.stem}__{safe_name(ws_name)}__chart{j}.png"
                 out_path = media_dir / fname
 
@@ -44,16 +51,26 @@ def _export_charts_via_excel_com(xlsx_path: Path, sheet_name: str, media_dir: Pa
                 chartImage.Save(str(out_path))
 
                 md_lines.append(f"![]({media_dir.name}/{fname})")
+
+                md_content = "### Charts\n"
+                md_content += f"![]({media_dir.name}/{fname})\n\n"
+
+                md_path = xlsx_path.with_name(
+                    f"{xlsx_path.stem}__{safe_name(ws_name)}__chart{j}.md"
+                )
+                md_path.write_text(md_content, encoding="utf-8")
+
     except Exception as e:
         print(e)
 
     return md_lines
 
 
-
 # チャートシートPNG化関数
-def _export_chart_sheets_via_excel_com(xlsx_path: Path, sheet_name: str, media_dir: Path) -> list[str]:
-    
+def _export_chart_sheets_via_excel_com(
+    xlsx_path: Path, sheet_name: str, media_dir: Path, md_dir: Path
+) -> list[str]:
+
     xlsx_path = Path(xlsx_path).resolve()
     media_dir = Path(media_dir).resolve()
     media_dir.mkdir(exist_ok=True)
@@ -73,10 +90,10 @@ def _export_chart_sheets_via_excel_com(xlsx_path: Path, sheet_name: str, media_d
 
             # ワークシート内の図形を繰り返し処理
             for j in range(worksheet.PrstGeomShapes.Count):
-                print('図形保存中')
+                print("図形保存中")
                 # 図形を取得
                 shape = worksheet.PrstGeomShapes.get_Item(j)
-                fname = f"{xlsx_path.stem}__{safe_name(ws_name)}__Shape{j}.png"
+                fname = f"{xlsx_path.stem}__{safe_name(ws_name)}__shape{j}.png"
                 out_path = media_dir / fname
 
                 # 図形をXlsShapeオブジェクトに変換
@@ -87,10 +104,21 @@ def _export_chart_sheets_via_excel_com(xlsx_path: Path, sheet_name: str, media_d
                 image.Save(str(out_path))
 
                 md_lines.append(f"![]({media_dir.name}/{fname})")
+
+                md_content = "### Shapes\n"
+                md_content += f"![]({media_dir.name}/{fname})\n\n"
+
+                md_path = xlsx_path.with_name(
+                    f"{xlsx_path.stem}__{safe_name(ws_name)}__shape{j}.md"
+                )
+                md_path.write_text(md_content, encoding="utf-8")
+
     except Exception as e:
         print(e)
 
     return md_lines
+
+
 # == Add by Masahiro (2026/01/28) ==
 
 
@@ -98,8 +126,8 @@ def _export_chart_sheets_via_excel_com(xlsx_path: Path, sheet_name: str, media_d
 # Save reporting of any exceptions for later
 _xlsx_dependency_exc_info = None
 try:
-    import pandas as pd
     import openpyxl  # noqa: F401
+    import pandas as pd
 except ImportError:
     _xlsx_dependency_exc_info = sys.exc_info()
 
@@ -149,22 +177,240 @@ class XlsxConverter(DocumentConverter):
 
         return False
 
+    # == Add by Masahiro (2026/02/09) ==
+    def find_true_segments(self, arr):
+        """
+        1次元 boolean array から
+        (start, end) の連続 True 区間を返す
+        """
+        segments = []
+        start = None
+
+        for i, v in enumerate(arr):
+            if v and start is None:
+                start = i
+            elif not v and start is not None:
+                segments.append((start, i - 1))
+                start = None
+
+        if start is not None:
+            segments.append((start, len(arr) - 1))
+
+        return segments
+
+    def count_nan_or_edge(self, mask, start_r, start_c, dr, dc):
+        """
+        mask から (start_r, start_c) の外側に向かって
+        dr, dc 方向に何マス連続で
+        - NaN
+        - または端
+        が続くかを数える
+        """
+        count = 0
+        r, c = start_r + dr, start_c + dc
+
+        while True:
+            if r < 0 or r >= mask.shape[0] or c < 0 or c >= mask.shape[1]:
+                count += 1
+                break
+            if mask[r, c]:
+                break
+            count += 1
+            r += dr
+            c += dc
+
+        return count
+
+    # 周囲が NaN（または端）かチェック
+    def is_nan_or_edge(self, mask, r, c):
+        if r < 0 or r >= mask.shape[0]:
+            return True
+        if c < 0 or c >= mask.shape[1]:
+            return True
+        return not mask[r, c]
+
+    def proc_md_content(
+        self,
+        md_content,
+        s,
+        sheets,
+        wb_img,
+        xlsx_path,
+        media_dir,
+        md_dir,
+        **kwargs: Any,
+    ):
+
+        # html_content = sheets[s].to_html(index=False)
+        df = sheets[s].replace(
+            r"^\s*$", pd.NA, regex=True
+        )  # 空文字も空扱いにする（不要なら削除OK）
+        # df = df.dropna(how="all")                            # NaNのみの行を削除
+
+        ## 矩形判定
+        mask = df.notna().to_numpy()
+
+        # print("変換前")
+        # print(mask)
+
+        # # 1列のNaN列をTrueに変換
+        # for c in range(1, mask.shape[1] - 1):
+        #     # この列がすべて NaN
+        #     if not mask[:, c].any():
+        #         # 左右の列にデータがある場合 → 細い区切り
+        #         if mask[:, c - 1].any() and mask[:, c + 1].any():
+        #             mask[:, c] = True
+
+        # --- 1列のNaN（T F T）を埋める ---
+        for c in range(1, mask.shape[1] - 1):
+            mask[:, c] |= mask[:, c - 1] & mask[:, c + 1]
+
+        # --- 2列のNaN（T F F T）を埋める ---
+        for c in range(1, mask.shape[1] - 2):
+            cond = ~mask[:, c] & ~mask[:, c + 1] & mask[:, c - 1] & mask[:, c + 2]
+            mask[cond, c] = True
+            mask[cond, c + 1] = True
+
+        # 1行NaN
+        for r in range(1, mask.shape[0] - 1):
+            mask[r, :] |= mask[r - 1, :] & mask[r + 1, :]
+
+        # 2行NaN
+        for r in range(1, mask.shape[0] - 2):
+            cond = ~mask[r, :] & ~mask[r + 1, :] & mask[r - 1, :] & mask[r + 2, :]
+            mask[r, cond] = True
+            mask[r + 1, cond] = True
+
+        # print("変換後")
+        # print(mask)
+        # print(df)
+
+        # 4近傍で連結成分を抽出
+        # label: Trueが隣接している塊に同じ番号を振る関数
+        labeled, num = label(mask)
+
+        blocks = []
+
+        for lab in range(1, num + 1):
+            coords = np.argwhere(labeled == lab)
+            r0, c0 = coords.min(axis=0)
+            r1, c1 = coords.max(axis=0)
+
+            # 各方向の NaN 幅を計算
+            top_gap = min(
+                self.count_nan_or_edge(mask, r0, c, -1, 0) for c in range(c0, c1 + 1)
+            )
+            bottom_gap = min(
+                self.count_nan_or_edge(mask, r1, c, 1, 0) for c in range(c0, c1 + 1)
+            )
+            left_gap = min(
+                self.count_nan_or_edge(mask, r, c0, 0, -1) for r in range(r0, r1 + 1)
+            )
+            right_gap = min(
+                self.count_nan_or_edge(mask, r, c1, 0, 1) for r in range(r0, r1 + 1)
+            )
+
+            nan_width_ok = (
+                top_gap >= 2 or bottom_gap >= 2 or left_gap >= 2 or right_gap >= 2
+            )
+
+            if not nan_width_ok:
+                continue
+
+            top_ok = all(
+                self.is_nan_or_edge(mask, r0 - 1, c) for c in range(c0, c1 + 1)
+            )
+            bottom_ok = all(
+                self.is_nan_or_edge(mask, r1 + 1, c) for c in range(c0, c1 + 1)
+            )
+            left_ok = all(
+                self.is_nan_or_edge(mask, r, c0 - 1) for r in range(r0, r1 + 1)
+            )
+            right_ok = all(
+                self.is_nan_or_edge(mask, r, c1 + 1) for r in range(r0, r1 + 1)
+            )
+
+            if not (top_ok and bottom_ok and left_ok and right_ok):
+                continue
+
+            blocks.append((r0, r1, c0, c1))
+
+        for r0, r1, c0, c1 in blocks:
+            md_content = f"## {s}_{r0}_{r1}_{c0}_{c1}\n"
+            md_name = f"{s}_{r0}_{r1}_{c0}_{c1}"
+            extracted = df.iloc[r0 : r1 + 1, c0 : c1 + 1]
+            html_content = extracted.to_html(index=False)
+            # html_contents.append(html_content)
+            md_content += (
+                self._html_converter.convert_string(
+                    html_content, **kwargs
+                ).markdown.strip()
+                + "\n\n"
+            )
+
+            # print("md_content:")
+            # print(md_content)
+
+            md_path = xlsx_path.with_name(
+                f"{xlsx_path.stem}_{safe_name(s)}_{md_name}.md"
+            )
+            print("md_path:", md_path)
+            md_path.write_text(md_content, encoding="utf-8")
+
+        # == Add by Masahiro (2026/02/09) ==
+
+        # html_content = df.to_html(index=False)
+
+        # md_content += (
+        #     self._html_converter.convert_string(html_content, **kwargs).markdown.strip()
+        #     + "\n\n"
+        # )
+
+        ws = wb_img[s]
+
+        # シート内画像の保存
+        images = getattr(ws, "_images", [])
+        if images:
+            for i, img in enumerate(images, start=1):
+                try:
+                    data = img._data()
+                except Exception:
+                    continue
+
+                md_content = "### Images\n"
+
+                fname = f"{xlsx_path.stem}__{s}__img{i}.png"
+                (media_dir / fname).write_bytes(data)
+                md_content += f"![]({media_dir.name}/{fname})\n\n"
+
+                md_path = xlsx_path.with_name(f"{xlsx_path.stem}__{s}__img{i}.md")
+                md_path.write_text(md_content, encoding="utf-8")
+
+        _ = _export_charts_via_excel_com(xlsx_path, s, media_dir, md_dir)
+        # if chart_md:
+        #     md_content += "### Charts\n" + "\n\n".join(chart_md) + "\n\n"
+
+        # _ = _export_chart_sheets_via_excel_com(xlsx_path, s, media_dir, md_dir)
+        # if chart_sheet_md:
+        #     md_content += "## Chart Sheets\n\n" + "\n".join(chart_sheet_md) + "\n"
+
+        return md_content
+
     def convert(
         self,
         file_stream: BinaryIO,
         stream_info: StreamInfo,
         **kwargs: Any,  # Options to pass to the converter
     ) -> DocumentConverterResult:
-        
 
-        import os
+        # import os
 
-        print("CWD:", os.getcwd())
-        print("stream_info.local_path:", stream_info.local_path)
-        print("resolved:", str(Path(stream_info.local_path).resolve()))
+        # print("CWD:", os.getcwd())
+        # print("stream_info.local_path:", stream_info.local_path)
+        # print("resolved:", str(Path(stream_info.local_path).resolve()))
 
-        p = Path(stream_info.local_path).resolve()
-        print("exists:", p.exists())
+        # p = Path(stream_info.local_path).resolve()
+        # print("exists:", p.exists())
 
         # Check the dependencies
         if _xlsx_dependency_exc_info is not None:
@@ -174,81 +420,45 @@ class XlsxConverter(DocumentConverter):
                     extension=".xlsx",
                     feature="xlsx",
                 )
-            ) from _xlsx_dependency_exc_info[
-                1
-            ].with_traceback(  # type: ignore[union-attr]
+            ) from _xlsx_dependency_exc_info[1].with_traceback(  # type: ignore[union-attr]
                 _xlsx_dependency_exc_info[2]
             )
 
         sheets = pd.read_excel(file_stream, sheet_name=None, engine="openpyxl")
-        print('file_stream:', file_stream)
-        print('stream_info;', stream_info)
-
+        # print('file_stream:', file_stream)
+        # print('stream_info;', stream_info)
 
         # == Add by Masahiro (2026/01/28) ==
 
-        print('stream_info.local_path:', stream_info.local_path)
+        # print('stream_info.local_path:', stream_info.local_path)
         xlsx_path = Path(stream_info.local_path).resolve()
         media_dir = xlsx_path.parent / "media"
         media_dir.mkdir(exist_ok=True)
 
+        md_dir = xlsx_path.parent / "md"
+        md_dir.mkdir(exist_ok=True)
+
         file_stream.seek(0)
         wb_img = load_workbook(file_stream, data_only=True)
-        
-        all_md_content = ""
 
-        def proc_md_content(md_content):
-            md_content += f"## {s}\n"
-            # html_content = sheets[s].to_html(index=False)
-            df = sheets[s].replace(r"^\s*$", pd.NA, regex=True)  # 空文字も空扱いにする（不要なら削除OK）
-            df = df.dropna(how="all")                            # NaNのみの行を削除
-            html_content = df.to_html(index=False)
+        # all_md_content = ""
 
-            md_content += (
-                self._html_converter.convert_string(
-                    html_content, **kwargs
-                ).markdown.strip()
-                + "\n\n"
-            )
-
-            ws = wb_img[s]
-
-            # シート内画像の保存
-            images = getattr(ws, "_images", [])
-            if images:
-                md_content += "### Images\n"
-                for i, img in enumerate(images, start=1):
-                    try:
-                        data = img._data()
-                    except Exception:
-                        continue
-
-                    fname = f"{xlsx_path.stem}__{s}__img{i}.png"
-                    (media_dir / fname).write_bytes(data)
-                    md_content += f"![]({media_dir.name}/{fname})\n\n"
-
-            chart_md = _export_charts_via_excel_com(xlsx_path, s, media_dir)
-            if chart_md:
-                md_content += "### Charts\n" + "\n\n".join(chart_md) + "\n\n"
-
-
-            chart_sheet_md = _export_chart_sheets_via_excel_com(xlsx_path, s, media_dir)
-            if chart_sheet_md:
-                md_content += "## Chart Sheets\n\n" + "\n".join(chart_sheet_md) + "\n"
-            
-            return md_content
-
-        for s in sheets:
+        for sheet_idx, s in enumerate(sheets, start=1):
+            print(s)
             md_content = ""
-            md_content = proc_md_content(md_content)
-            all_md_content = proc_md_content(all_md_content)
+            md_content = self.proc_md_content(
+                md_content, s, sheets, wb_img, xlsx_path, media_dir, md_dir, **kwargs
+            )
+            # all_md_content = proc_md_content(all_md_content)
 
-            md_path = xlsx_path.with_name(f"{xlsx_path.stem}_{safe_name(s)}.md")
-            md_path.write_text(md_content, encoding="utf-8")
-        
-        # == Add by Masahiro (2026/01/28) ==
+            # md_path = xlsx_path.with_name(f"{xlsx_path.stem}_{safe_name(s)}.md")
+            # md_path.write_text(md_content, encoding="utf-8")
 
-        return DocumentConverterResult(markdown=all_md_content.strip())
+            # == Add by Masahiro (2026/01/28) ==
+            # print("md_content")
+            # print(md_content)
+
+        return DocumentConverterResult(markdown=md_content.strip())
 
 
 class XlsConverter(DocumentConverter):
@@ -278,50 +488,257 @@ class XlsConverter(DocumentConverter):
 
         return False
 
-    def convert(
+    # def convert(
+    #     self,
+    #     file_stream: BinaryIO,
+    #     stream_info: StreamInfo,
+    #     **kwargs: Any,  # Options to pass to the converter
+    # ) -> DocumentConverterResult:
+    #     # Load the dependencies
+    #     if _xls_dependency_exc_info is not None:
+    #         raise MissingDependencyException(
+    #             MISSING_DEPENDENCY_MESSAGE.format(
+    #                 converter=type(self).__name__,
+    #                 extension=".xls",
+    #                 feature="xls",
+    #             )
+    #         ) from _xls_dependency_exc_info[1].with_traceback(  # type: ignore[union-attr]
+    #             _xls_dependency_exc_info[2]
+    #         )
+
+    #     sheets = pd.read_excel(file_stream, sheet_name=None, engine="xlrd")
+    #     # md_content = ""
+
+    #     # == Add by Masahiro (2026/01/28) ==
+
+    #     print("stream_info.local_path:", stream_info.local_path)
+    #     xlsx_path = Path(stream_info.local_path).resolve()
+    #     media_dir = xlsx_path.parent / "media"
+    #     media_dir.mkdir(exist_ok=True)
+
+    #     file_stream.seek(0)
+    #     wb_img = load_workbook(file_stream, data_only=True)
+
+    #     # == Add by Masahiro (2026/01/28) ==
+
+    #     all_md_content = ""
+
+    #     def proc_md_content(md_content):
+    #         md_content += f"## {s}\n"
+    #         # html_content = sheets[s].to_html(index=False)
+    #         df = sheets[s].replace(
+    #             r"^\s*$", pd.NA, regex=True
+    #         )  # 空文字も空扱いにする（不要なら削除OK）
+    #         df = df.dropna(how="all")  # NaNのみの行を削除
+    #         html_content = df.to_html(index=False)
+
+    #         md_content += (
+    #             self._html_converter.convert_string(
+    #                 html_content, **kwargs
+    #             ).markdown.strip()
+    #             + "\n\n"
+    #         )
+
+    #         ws = wb_img[s]
+
+    #         # シート内画像の保存
+    #         images = getattr(ws, "_images", [])
+    #         if images:
+    #             md_content += "### Images\n"
+    #             for i, img in enumerate(images, start=1):
+    #                 try:
+    #                     data = img._data()
+    #                 except Exception:
+    #                     continue
+
+    #                 fname = f"{xlsx_path.stem}__{s}__img{i}.png"
+    #                 (media_dir / fname).write_bytes(data)
+    #                 md_content += f"![]({media_dir.name}/{fname})\n\n"
+
+    #         chart_md = _export_charts_via_excel_com(xlsx_path, s, media_dir)
+    #         if chart_md:
+    #             md_content += "### Charts\n" + "\n\n".join(chart_md) + "\n\n"
+
+    #         chart_sheet_md = _export_chart_sheets_via_excel_com(xlsx_path, s, media_dir)
+    #         if chart_sheet_md:
+    #             md_content += "## Chart Sheets\n\n" + "\n".join(chart_sheet_md) + "\n"
+
+    #         return md_content
+
+    #     for s in sheets:
+    #         md_content = ""
+    #         md_content = proc_md_content(md_content)
+    #         all_md_content = proc_md_content(all_md_content)
+
+    #         md_path = xlsx_path.with_name(f"{xlsx_path.stem}_{safe_name(s)}.md")
+    #         md_path.write_text(md_content, encoding="utf-8")
+    #         # == Add by Masahiro (2026/01/28) ==
+
+    #     return DocumentConverterResult(markdown=md_content.strip())
+
+    def find_true_segments(self, arr):
+        """
+        1次元 boolean array から
+        (start, end) の連続 True 区間を返す
+        """
+        segments = []
+        start = None
+
+        for i, v in enumerate(arr):
+            if v and start is None:
+                start = i
+            elif not v and start is not None:
+                segments.append((start, i - 1))
+                start = None
+
+        if start is not None:
+            segments.append((start, len(arr) - 1))
+
+        return segments
+
+    def count_nan_or_edge(self, mask, start_r, start_c, dr, dc):
+        """
+        mask から (start_r, start_c) の外側に向かって
+        dr, dc 方向に何マス連続で
+        - NaN
+        - または端
+        が続くかを数える
+        """
+        count = 0
+        r, c = start_r + dr, start_c + dc
+
+        while True:
+            if r < 0 or r >= mask.shape[0] or c < 0 or c >= mask.shape[1]:
+                count += 1
+                break
+            if mask[r, c]:
+                break
+            count += 1
+            r += dr
+            c += dc
+
+        return count
+
+    # 周囲が NaN（または端）かチェック
+    def is_nan_or_edge(self, mask, r, c):
+        if r < 0 or r >= mask.shape[0]:
+            return True
+        if c < 0 or c >= mask.shape[1]:
+            return True
+        return not mask[r, c]
+
+    def proc_md_content(
         self,
-        file_stream: BinaryIO,
-        stream_info: StreamInfo,
-        **kwargs: Any,  # Options to pass to the converter
-    ) -> DocumentConverterResult:
-        # Load the dependencies
-        if _xls_dependency_exc_info is not None:
-            raise MissingDependencyException(
-                MISSING_DEPENDENCY_MESSAGE.format(
-                    converter=type(self).__name__,
-                    extension=".xls",
-                    feature="xls",
-                )
-            ) from _xls_dependency_exc_info[
-                1
-            ].with_traceback(  # type: ignore[union-attr]
-                _xls_dependency_exc_info[2]
+        md_content,
+        s,
+        sheets,
+        wb_img,
+        xlsx_path,
+        media_dir,
+        md_dir,
+        **kwargs: Any,
+    ):
+
+        # html_content = sheets[s].to_html(index=False)
+        df = sheets[s].replace(
+            r"^\s*$", pd.NA, regex=True
+        )  # 空文字も空扱いにする（不要なら削除OK）
+        # df = df.dropna(how="all")                            # NaNのみの行を削除
+
+        ## 矩形判定
+        mask = df.notna().to_numpy()
+
+        # print("変換前")
+        # print(mask)
+
+        # # 1列のNaN列をTrueに変換
+        # for c in range(1, mask.shape[1] - 1):
+        #     # この列がすべて NaN
+        #     if not mask[:, c].any():
+        #         # 左右の列にデータがある場合 → 細い区切り
+        #         if mask[:, c - 1].any() and mask[:, c + 1].any():
+        #             mask[:, c] = True
+
+        # --- 1列のNaN（T F T）を埋める ---
+        for c in range(1, mask.shape[1] - 1):
+            mask[:, c] |= mask[:, c - 1] & mask[:, c + 1]
+
+        # --- 2列のNaN（T F F T）を埋める ---
+        for c in range(1, mask.shape[1] - 2):
+            cond = ~mask[:, c] & ~mask[:, c + 1] & mask[:, c - 1] & mask[:, c + 2]
+            mask[cond, c] = True
+            mask[cond, c + 1] = True
+
+        # 1行NaN
+        for r in range(1, mask.shape[0] - 1):
+            mask[r, :] |= mask[r - 1, :] & mask[r + 1, :]
+
+        # 2行NaN
+        for r in range(1, mask.shape[0] - 2):
+            cond = ~mask[r, :] & ~mask[r + 1, :] & mask[r - 1, :] & mask[r + 2, :]
+            mask[r, cond] = True
+            mask[r + 1, cond] = True
+
+        # print("変換後")
+        # print(mask)
+        # print(df)
+
+        # 4近傍で連結成分を抽出
+        # label: Trueが隣接している塊に同じ番号を振る関数
+        labeled, num = label(mask)
+
+        blocks = []
+
+        for lab in range(1, num + 1):
+            coords = np.argwhere(labeled == lab)
+            r0, c0 = coords.min(axis=0)
+            r1, c1 = coords.max(axis=0)
+
+            # 各方向の NaN 幅を計算
+            top_gap = min(
+                self.count_nan_or_edge(mask, r0, c, -1, 0) for c in range(c0, c1 + 1)
+            )
+            bottom_gap = min(
+                self.count_nan_or_edge(mask, r1, c, 1, 0) for c in range(c0, c1 + 1)
+            )
+            left_gap = min(
+                self.count_nan_or_edge(mask, r, c0, 0, -1) for r in range(r0, r1 + 1)
+            )
+            right_gap = min(
+                self.count_nan_or_edge(mask, r, c1, 0, 1) for r in range(r0, r1 + 1)
             )
 
-        sheets = pd.read_excel(file_stream, sheet_name=None, engine="xlrd")
-        # md_content = ""
+            nan_width_ok = (
+                top_gap >= 2 or bottom_gap >= 2 or left_gap >= 2 or right_gap >= 2
+            )
 
-        # == Add by Masahiro (2026/01/28) ==
+            if not nan_width_ok:
+                continue
 
-        print('stream_info.local_path:', stream_info.local_path)
-        xlsx_path = Path(stream_info.local_path).resolve()
-        media_dir = xlsx_path.parent / "media"
-        media_dir.mkdir(exist_ok=True)
+            top_ok = all(
+                self.is_nan_or_edge(mask, r0 - 1, c) for c in range(c0, c1 + 1)
+            )
+            bottom_ok = all(
+                self.is_nan_or_edge(mask, r1 + 1, c) for c in range(c0, c1 + 1)
+            )
+            left_ok = all(
+                self.is_nan_or_edge(mask, r, c0 - 1) for r in range(r0, r1 + 1)
+            )
+            right_ok = all(
+                self.is_nan_or_edge(mask, r, c1 + 1) for r in range(r0, r1 + 1)
+            )
 
-        file_stream.seek(0)
-        wb_img = load_workbook(file_stream, data_only=True)
+            if not (top_ok and bottom_ok and left_ok and right_ok):
+                continue
 
-        # == Add by Masahiro (2026/01/28) ==
+            blocks.append((r0, r1, c0, c1))
 
-        all_md_content = ""
-
-        def proc_md_content(md_content):
-            md_content += f"## {s}\n"
-            # html_content = sheets[s].to_html(index=False)
-            df = sheets[s].replace(r"^\s*$", pd.NA, regex=True)  # 空文字も空扱いにする（不要なら削除OK）
-            df = df.dropna(how="all")                            # NaNのみの行を削除
-            html_content = df.to_html(index=False)
-
+        for r0, r1, c0, c1 in blocks:
+            md_content = f"## {s}_{r0}_{r1}_{c0}_{c1}\n"
+            md_name = f"{s}_{r0}_{r1}_{c0}_{c1}"
+            extracted = df.iloc[r0 : r1 + 1, c0 : c1 + 1]
+            html_content = extracted.to_html(index=False)
+            # html_contents.append(html_content)
             md_content += (
                 self._html_converter.convert_string(
                     html_content, **kwargs
@@ -329,40 +746,114 @@ class XlsConverter(DocumentConverter):
                 + "\n\n"
             )
 
-            ws = wb_img[s]
+            # print("md_content:")
+            # print(md_content)
 
-            # シート内画像の保存
-            images = getattr(ws, "_images", [])
-            if images:
-                md_content += "### Images\n"
-                for i, img in enumerate(images, start=1):
-                    try:
-                        data = img._data()
-                    except Exception:
-                        continue
-
-                    fname = f"{xlsx_path.stem}__{s}__img{i}.png"
-                    (media_dir / fname).write_bytes(data)
-                    md_content += f"![]({media_dir.name}/{fname})\n\n"
-
-            chart_md = _export_charts_via_excel_com(xlsx_path, s, media_dir)
-            if chart_md:
-                md_content += "### Charts\n" + "\n\n".join(chart_md) + "\n\n"
-
-
-            chart_sheet_md = _export_chart_sheets_via_excel_com(xlsx_path, s, media_dir)
-            if chart_sheet_md:
-                md_content += "## Chart Sheets\n\n" + "\n".join(chart_sheet_md) + "\n"
-            
-            return md_content
-
-        for s in sheets:
-            md_content = ""
-            md_content = proc_md_content(md_content)
-            all_md_content = proc_md_content(all_md_content)
-
-            md_path = xlsx_path.with_name(f"{xlsx_path.stem}_{safe_name(s)}.md")
+            md_path = xlsx_path.with_name(
+                f"{xlsx_path.stem}_{safe_name(s)}_{md_name}.md"
+            )
+            print("md_path:", md_path)
             md_path.write_text(md_content, encoding="utf-8")
+
+        # == Add by Masahiro (2026/02/09) ==
+
+        # html_content = df.to_html(index=False)
+
+        # md_content += (
+        #     self._html_converter.convert_string(html_content, **kwargs).markdown.strip()
+        #     + "\n\n"
+        # )
+
+        ws = wb_img[s]
+
+        # シート内画像の保存
+        images = getattr(ws, "_images", [])
+        if images:
+            for i, img in enumerate(images, start=1):
+                try:
+                    data = img._data()
+                except Exception:
+                    continue
+
+                md_content = "### Images\n"
+
+                fname = f"{xlsx_path.stem}__{s}__img{i}.png"
+                (media_dir / fname).write_bytes(data)
+                md_content += f"![]({media_dir.name}/{fname})\n\n"
+
+                md_path = xlsx_path.with_name(f"{xlsx_path.stem}__{s}__img{i}.md")
+                md_path.write_text(md_content, encoding="utf-8")
+
+        _ = _export_charts_via_excel_com(xlsx_path, s, media_dir)
+        # if chart_md:
+        #     md_content += "### Charts\n" + "\n\n".join(chart_md) + "\n\n"
+
+        # _ = _export_chart_sheets_via_excel_com(xlsx_path, s, media_dir)
+        # if chart_sheet_md:
+        #     md_content += "## Chart Sheets\n\n" + "\n".join(chart_sheet_md) + "\n"
+
+        return md_content
+
+    def convert(
+        self,
+        file_stream: BinaryIO,
+        stream_info: StreamInfo,
+        **kwargs: Any,  # Options to pass to the converter
+    ) -> DocumentConverterResult:
+
+        # import os
+
+        # print("CWD:", os.getcwd())
+        # print("stream_info.local_path:", stream_info.local_path)
+        # print("resolved:", str(Path(stream_info.local_path).resolve()))
+
+        # p = Path(stream_info.local_path).resolve()
+        # print("exists:", p.exists())
+
+        # Check the dependencies
+        if _xlsx_dependency_exc_info is not None:
+            raise MissingDependencyException(
+                MISSING_DEPENDENCY_MESSAGE.format(
+                    converter=type(self).__name__,
+                    extension=".xlsx",
+                    feature="xlsx",
+                )
+            ) from _xlsx_dependency_exc_info[1].with_traceback(  # type: ignore[union-attr]
+                _xlsx_dependency_exc_info[2]
+            )
+
+        sheets = pd.read_excel(file_stream, sheet_name=None, engine="openpyxl")
+        # print('file_stream:', file_stream)
+        # print('stream_info;', stream_info)
+
+        # == Add by Masahiro (2026/01/28) ==
+
+        # print('stream_info.local_path:', stream_info.local_path)
+        xlsx_path = Path(stream_info.local_path).resolve()
+        media_dir = xlsx_path.parent / "media"
+        media_dir.mkdir(exist_ok=True)
+
+        md_dir = xlsx_path.parent / "md"
+        md_dir.mkdir(exist_ok=True)
+
+        file_stream.seek(0)
+        wb_img = load_workbook(file_stream, data_only=True)
+
+        # all_md_content = ""
+
+        for sheet_idx, s in enumerate(sheets, start=1):
+            print(s)
+            md_content = ""
+            md_content = self.proc_md_content(
+                md_content, s, sheets, wb_img, xlsx_path, media_dir, md_dir, **kwargs
+            )
+            # all_md_content = proc_md_content(all_md_content)
+
+            # md_path = xlsx_path.with_name(f"{xlsx_path.stem}_{safe_name(s)}.md")
+            # md_path.write_text(md_content, encoding="utf-8")
+
             # == Add by Masahiro (2026/01/28) ==
+            # print("md_content")
+            # print(md_content)
 
         return DocumentConverterResult(markdown=md_content.strip())
