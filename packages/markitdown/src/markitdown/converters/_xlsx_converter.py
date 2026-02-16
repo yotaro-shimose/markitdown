@@ -1,7 +1,9 @@
 import re
 import sys
+import zipfile
 from pathlib import Path
 from typing import Any, BinaryIO
+from xml.etree import ElementTree as ET
 
 import numpy as np
 import numpy.typing as npt
@@ -21,8 +23,9 @@ Mask2D = npt.NDArray[np.bool_]
 
 
 def safe_name(name: str) -> str:
-    # Windowsで使えない文字を置換
-    return re.sub(r'[\\/:*?"<>|]', "_", name)
+    original = name
+    sanitized = re.sub(r'[\\/:*?"<>|]', "_", original)
+    return sanitized
 
 
 def _export_charts_via_excel_com(
@@ -120,6 +123,115 @@ def _export_chart_sheets_via_excel_com(
         print(e)
 
     return md_lines
+
+
+NS = {
+    "ws": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+    "rel": "http://schemas.openxmlformats.org/package/2006/relationships",
+    "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+}
+
+
+def _rels_map(z: zipfile.ZipFile, rels_path: str) -> dict[str, dict]:
+    root = ET.fromstring(z.read(rels_path))
+    m = {}
+    for rel in root.findall("rel:Relationship", NS):
+        m[rel.attrib["Id"]] = {
+            "Type": rel.attrib.get("Type"),
+            "Target": rel.attrib.get("Target"),
+        }
+    return m
+
+
+def extract_sheet_images(
+    xlsx_path: str | Path, sheet_name: str, media_dir: str | Path
+) -> list[Path]:
+    xlsx_path = Path(xlsx_path)
+    media_dir = Path(media_dir)
+    media_dir.mkdir(parents=True, exist_ok=True)
+
+    saved: list[Path] = []
+
+    with zipfile.ZipFile(xlsx_path) as z:
+        # 1) sheet_name -> xl/worksheets/sheetN.xml
+        wb = ET.fromstring(z.read("xl/workbook.xml"))
+        wb_rels = _rels_map(z, "xl/_rels/workbook.xml.rels")
+
+        sheet_target = None
+        for sh in wb.findall("ws:sheets/ws:sheet", NS):
+            if sh.attrib.get("name") == sheet_name:
+                rid = sh.attrib.get(f"{{{NS['r']}}}id")
+                sheet_target = wb_rels[rid]["Target"]  # e.g. 'worksheets/sheet3.xml'
+                break
+        if not sheet_target:
+            raise KeyError(f"sheet not found: {sheet_name}")
+
+        sheet_path = "xl/" + sheet_target  # xl/worksheets/sheetN.xml
+        sheet_rels_path = (
+            sheet_path.replace("xl/worksheets/", "xl/worksheets/_rels/") + ".rels"
+        )
+
+        # 2) sheetN.xml.rels -> drawing*.xml
+        sheet_rels = _rels_map(z, sheet_rels_path)
+        drawing_targets = [
+            rel["Target"]
+            for rel in sheet_rels.values()
+            if (rel.get("Type") or "").endswith("/drawing")
+        ]
+        if not drawing_targets:
+            return []
+
+        # 3) drawing*.xml -> rIdX (embed)
+        embed_rids: set[str] = set()
+        for dt in drawing_targets:
+            drawing_path = "xl/" + dt.replace(
+                "../", ""
+            )  # '../drawings/drawing1.xml' -> 'xl/drawings/drawing1.xml'
+            drawing_xml = z.read(drawing_path)
+
+            # 文字列検索
+            text = drawing_xml.decode("utf-8", errors="ignore")
+
+            embed_rids.update(re.findall(r'r:embed="(rId\d+)"', text))
+
+            # 4) drawing*.xml.rels -> rIdX -> media
+            drawing_rels_path = (
+                drawing_path.replace("xl/drawings/", "xl/drawings/_rels/") + ".rels"
+            )
+            drawing_rels = _rels_map(z, drawing_rels_path)
+
+            for i, rid in enumerate(sorted(embed_rids), start=1):
+                rel = drawing_rels.get(rid)
+                if not rel:
+                    continue
+                if not (rel.get("Type") or "").endswith("/image"):
+                    continue
+                target = rel["Target"]  # ../media/image8.png
+                media_path = "xl/" + target.replace("../", "")  # xl/media/image8.png
+
+                data = z.read(media_path)
+                md_content = "### Images\n"
+                fname = f"{xlsx_path.stem}__{sheet_name}__img{i}.png"
+                (media_dir / fname).write_bytes(data)
+                md_content += f"![]({media_dir.name}/{fname})\n\n"
+
+                md_path = xlsx_path.with_name(
+                    f"{xlsx_path.stem}__{sheet_name}__img{i}.md"
+                )
+                md_path.write_text(md_content, encoding="utf-8")
+
+                saved.append(media_dir / fname)
+
+    # 重複排除（同じ画像が複数回配置されるケース）
+    uniq = []
+    seen = set()
+    for p in saved:
+        if p.name in seen:
+            continue
+        seen.add(p.name)
+        uniq.append(p)
+    return uniq
 
 
 # Try loading optional (but in this case, required) dependencies
@@ -322,27 +434,15 @@ class XlsxConverter(DocumentConverter):
             print("md_path:", md_path)
             md_path.write_text(md_content, encoding="utf-8")
 
-        ws = wb_img[s]
-
-        # シート内画像の保存
-        images = getattr(ws, "_images", [])
-        if images:
-            for i, img in enumerate(images, start=1):
-                try:
-                    data = img._data()
-                except Exception:
-                    continue
-
-                md_content = "### Images\n"
-
-                fname = f"{xlsx_path.stem}__{s}__img{i}.png"
-                (media_dir / fname).write_bytes(data)
-                md_content += f"![]({media_dir.name}/{fname})\n\n"
-
-                md_path = xlsx_path.with_name(f"{xlsx_path.stem}__{s}__img{i}.md")
-                md_path.write_text(md_content, encoding="utf-8")
+        try:
+            saved = extract_sheet_images(xlsx_path, sheet_name=s, media_dir=media_dir)
+            print([p.name for p in saved])
+        except Exception as e:
+            print("Exception (debug):", e)
 
         _ = _export_charts_via_excel_com(xlsx_path, s, media_dir, md_dir)
+
+        md_content = ""  # 何も入っていないシート対策（意味のある返り値が欲しいときは適宜修正してください）
 
         return md_content
 
@@ -377,8 +477,14 @@ class XlsxConverter(DocumentConverter):
         md_dir = xlsx_path.parent / "md"
         md_dir.mkdir(exist_ok=True)
 
-        file_stream.seek(0)
-        wb_img = load_workbook(file_stream, data_only=True)
+        # wb_img = load_workbook(file_stream, data_only=True)
+        wb_img = load_workbook(filename=str(xlsx_path), data_only=True)
+        # data = file_stream.read()
+        # with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
+        #     f.write(data)
+        #     tmp_path = f.name
+
+        # wb_img = load_workbook(tmp_path, data_only=True)
 
         md_content = ""
         for sheet_idx, s in enumerate(sheets, start=1):
@@ -561,27 +667,43 @@ class XlsConverter(DocumentConverter):
             print("md_path:", md_path)
             md_path.write_text(md_content, encoding="utf-8")
 
-        ws = wb_img[s]
+        try:
+            saved = extract_sheet_images(xlsx_path, sheet_name=s, media_dir=media_dir)
+            print([p.name for p in saved])
+        except Exception as e:
+            print("Exception (debug):", e)
+        # ws = wb_img[s]
 
-        # シート内画像の保存
-        images = getattr(ws, "_images", [])
-        if images:
-            for i, img in enumerate(images, start=1):
-                try:
-                    data = img._data()
-                except Exception:
-                    continue
+        # print("dir(ws):", dir(ws))
 
-                md_content = "### Images\n"
+        # # シート内画像の保存
+        # images = getattr(ws, "_images", [])
+        # if images:
+        #     for i, img in enumerate(images, start=1):
+        #         try:
+        #             print("画像データ読み込み成功")
+        #             data = img._data()
+        #             print("OK", s, i, type(img), len(data))
+        #         except Exception as e:
+        #             print("Exception (debug):", e)
+        #             print("NG", s, i, type(img))
+        #             continue
 
-                fname = f"{xlsx_path.stem}__{s}__img{i}.png"
-                (media_dir / fname).write_bytes(data)
-                md_content += f"![]({media_dir.name}/{fname})\n\n"
+        #         md_content = "### Images\n"
 
-                md_path = xlsx_path.with_name(f"{xlsx_path.stem}__{s}__img{i}.md")
-                md_path.write_text(md_content, encoding="utf-8")
+        #         fname = f"{xlsx_path.stem}__{s}__img{i}.png"
+        #         (media_dir / fname).write_bytes(data)
+        #         md_content += f"![]({media_dir.name}/{fname})\n\n"
+
+        #         md_path = xlsx_path.with_name(f"{xlsx_path.stem}__{s}__img{i}.md")
+        #         md_path.write_text(md_content, encoding="utf-8")
+        # else:
+        #     saved = extract_sheet_images(xlsx_path, sheet_name=s, media_dir=media_dir)
+        #     print([p.name for p in saved])
 
         _ = _export_charts_via_excel_com(xlsx_path, s, media_dir, md_dir)
+
+        md_content = ""  # 何も入っていないシート対策（意味のある返り値が欲しいときは適宜修正してください）
 
         return md_content
 
@@ -604,6 +726,8 @@ class XlsConverter(DocumentConverter):
                 _xlsx_dependency_exc_info[2]
             )
 
+        # file_stream.seek(0)
+
         sheets = pd.read_excel(file_stream, sheet_name=None, engine="openpyxl")
 
         if stream_info.local_path is None:
@@ -616,8 +740,13 @@ class XlsConverter(DocumentConverter):
         md_dir = xlsx_path.parent / "md"
         md_dir.mkdir(exist_ok=True)
 
-        file_stream.seek(0)
         wb_img = load_workbook(file_stream, data_only=True)
+        # data = file_stream.read()
+        # with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
+        #     f.write(data)
+        #     tmp_path = f.name
+
+        # wb_img = load_workbook(tmp_path, data_only=True)
 
         md_content = ""
         for sheet_idx, s in enumerate(sheets, start=1):
